@@ -203,3 +203,10 @@ process.on("unhandledRejection", console.error);
 // ================= LOGIN =================
 
 client.login(TOKEN);
+
+process.on("unhandledRejection", console.error);
+process.on("uncaughtException", console.error);
+
+// Prevent Railway from thinking app is done
+setInterval(() => {}, 1000);
+

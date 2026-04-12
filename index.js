@@ -1,13 +1,15 @@
+require('dotenv').config();
+try { process.env.FFMPEG_PATH = require('ffmpeg-static'); } catch (e) { }
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => {
-  res.send("Bot is running");
+    res.send("Bot is running");
 });
 
 app.listen(PORT, () => {
-  console.log(`Web server running on port ${PORT}`);
+    console.log(`Web server running on port ${PORT}`);
 });
 
 
@@ -23,8 +25,15 @@ const {
 
 const {
     joinVoiceChannel,
-    getVoiceConnection
+    getVoiceConnection,
+    createAudioPlayer,
+    createAudioResource,
+    NoSubscriberBehavior,
+    AudioPlayerStatus,
+    entersState,
+    VoiceConnectionStatus
 } = require("@discordjs/voice");
+const playdl = require("play-dl");
 
 // ================= CONFIG =================
 
@@ -62,7 +71,15 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("leave")
-        .setDescription("Leave voice channel")
+        .setDescription("Leave voice channel"),
+
+    new SlashCommandBuilder()
+        .setName("play")
+        .setDescription("Play a song from YouTube or Soundcloud")
+        .addStringOption(option =>
+            option.setName("song")
+                .setDescription("Search query or URL")
+                .setRequired(true))
 ].map(cmd => cmd.toJSON());
 
 if (CLIENT_ID && GUILD_ID) {
@@ -117,6 +134,20 @@ const userMessages = new Map();
 client.on("messageCreate", async (message) => {
     if (message.author.bot) return;
 
+    // Anti-Link System (Except Admin & Promotion Channels)
+    const containsLink = /https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*)/.test(message.content)
+        || /(discord\.gg\/|discord\.com\/invite\/|discordapp\.com\/invite\/)/.test(message.content.toLowerCase());
+
+    if (containsLink && message.member && !message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        const channelName = message.channel.name ? message.channel.name.toLowerCase() : "";
+        if (!channelName.includes("promotion") && !message.channel.name.includes("𝑷𝒓𝒐𝒎𝒐𝒕𝒊𝒐𝒏")) {
+            await message.delete().catch(() => { });
+            const alertMsg = await message.channel.send(`⚠️ ${message.author}, links are not allowed here! Please post them in the promotion channel.`);
+            setTimeout(() => alertMsg.delete().catch(() => { }), 5000);
+            return;
+        }
+    }
+
     const now = Date.now();
     const timestamps = userMessages.get(message.author.id) || [];
     timestamps.push(now);
@@ -126,21 +157,54 @@ client.on("messageCreate", async (message) => {
     userMessages.set(message.author.id, filtered);
 
     if (filtered.length >= antiSpamLimit) {
-        await message.delete().catch(() => {});
-        message.channel.send(`${message.author}, stop spamming!`);
+        await message.delete().catch(() => { });
+
+        try {
+            // Mute for 12 hours (12 * 60 * 60 * 1000 ms)
+            if (message.member && message.member.moderatable) {
+                await message.member.timeout(12 * 60 * 60 * 1000, "Spamming detected");
+            }
+
+            // Send public message
+            await message.channel.send(`🔇 ${message.author} has been muted for 12 hours due to spamming.`);
+
+            // Send DM
+            await message.author.send("You have been muted for 12 hours for spamming the server.");
+        } catch (err) {
+            console.error("Failed to mute/DM user:", err);
+            message.channel.send(`${message.author}, please stop spamming! (Note: Failed to apply mute)`);
+        }
+
+        // Reset their message count so they don't get muted again continuously
+        userMessages.delete(message.author.id);
+
         return;
     }
 
-    // DM when mentioned
-    message.mentions.users.forEach(async (user) => {
-        if (!user.bot) {
+    // Grouped user mention alerting
+    const mentionedUsers = message.mentions.users.filter(u => !u.bot && u.id !== message.author.id);
+    if (mentionedUsers.size > 0) {
+        const userTags = mentionedUsers.map(u => u.toString()).join(", ");
+        await message.channel.send(`🔔 ${userTags}, you have been mentioned by ${message.author}! Please check your DMs.`).catch(() => { });
+
+        mentionedUsers.forEach(async (user) => {
             try {
                 await user.send(
-                    `🔔 You were mentioned in #${message.channel.name}\n\n${message.content}`
+                    `🔔 You were mentioned in #${message.channel.name} by ${message.author.tag}:\n\n${message.content}`
                 );
-            } catch {}
+            } catch { }
+        });
+    }
+
+    // When the bot itself is mentioned
+    if (message.mentions.users.has(client.user.id)) {
+        await message.channel.send(`Hello ${message.author}, how can I help you? I also sent you a DM!`);
+        try {
+            await message.author.send(`You mentioned me in #${message.channel.name}! I am the 4CZ Secure 24/7 bot. Try using my slash commands like /ping.`);
+        } catch (err) {
+            console.error("Could not DM user who mentioned bot.");
         }
-    });
+    }
 
     // Admin warning
     if (
@@ -197,6 +261,67 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply("👋 Left the voice channel.");
         }
 
+        if (interaction.commandName === "play") {
+            const query = interaction.options.getString("song");
+            const channel = interaction.member.voice.channel;
+
+            if (!channel) {
+                return interaction.reply({ content: "❌ Join a voice channel first.", ephemeral: true });
+            }
+
+            await interaction.deferReply();
+
+            let connection = getVoiceConnection(interaction.guild.id);
+            if (!connection) {
+                connection = joinVoiceChannel({
+                    channelId: channel.id,
+                    guildId: interaction.guild.id,
+                    adapterCreator: interaction.guild.voiceAdapterCreator,
+                    selfDeaf: false,
+                    selfMute: false
+                });
+            }
+
+            try {
+                // Search up using yt-search to bypass blocks
+                const ytSearch = require("yt-search");
+                const ytdl = require("@distube/ytdl-core");
+
+                // Check if query is a URL or search text
+                const r = await ytSearch(query);
+                const video = r.videos.length > 0 ? r.videos[0] : null;
+
+                if (!video) {
+                    return interaction.editReply("❌ Song not found!");
+                }
+
+                // Streaming via distube wrapper that dodges "Sign in" errors
+                const stream = ytdl(video.url, {
+                    filter: "audioonly",
+                    quality: "highestaudio",
+                    highWaterMark: 1 << 25
+                });
+
+                const resource = createAudioResource(stream);
+
+                const player = createAudioPlayer({
+                    behaviors: { noSubscriber: NoSubscriberBehavior.Play }
+                });
+
+                player.play(resource);
+                connection.subscribe(player);
+
+                player.on('error', error => {
+                    console.error("Audio Player Error:", error);
+                });
+
+                return interaction.editReply(`🎶 Now playing: **${video.title}**`);
+            } catch (err) {
+                console.error("Play error:", err);
+                return interaction.editReply("❌ An error occurred while trying to play the song.");
+            }
+        }
+
     } catch (err) {
         console.error("Interaction error:", err);
 
@@ -215,11 +340,14 @@ process.on("unhandledRejection", console.error);
 
 // ================= LOGIN =================
 
-client.login(TOKEN);
+client.login(TOKEN).catch((err) => {
+    require("fs").writeFileSync("login_error.txt", err.toString() + "\n" + err.stack);
+    console.error("CRITICAL LOGIN ERROR:", err);
+});
 
 process.on("unhandledRejection", console.error);
 process.on("uncaughtException", console.error);
 
 // Prevent Railway from thinking app is done
-setInterval(() => {}, 1000);
+setInterval(() => { }, 1000);
 

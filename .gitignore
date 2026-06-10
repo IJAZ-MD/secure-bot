@@ -1,4 +1,5 @@
 node_modules/
+bin/
 .env
 *.log
 login_error.txt
